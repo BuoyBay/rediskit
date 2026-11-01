@@ -1,0 +1,374 @@
+Public Enum RespKind As Integer
+    SimpleString
+    ErrorReply
+    IntegerReply
+    BulkString
+    ArrayReply
+    NullBulk
+    NullArray
+End Enum
+
+''' Caller-owned decoded RESP value. Data preserves bytes; no implicit text decoding.
+Public Class RespValue
+    Public Property Kind As RespKind
+    Public Property Data As Bytes = New Bytes()
+    Public Property Number As Integer = 0
+    Public Property Items As Array Of RespValue = []
+End Class
+
+Private Class RespFrame
+    Public Property Value As RespValue
+    Public Property Remaining As Integer
+End Class
+
+Private Function RespSlice(data As Bytes, start As Integer, length As Integer) As Bytes
+    Dim output As New Bytes(length)
+    For i As Integer = 0 To length - 1
+        output.Append(data.Item(start + i))
+    Next
+    Return output
+End Function
+
+Private Function RespNumber(data As Bytes, signed As Boolean) As Integer
+    If data.Count = 0 Or data.Count > 20 Then Throw New InvalidArgumentException("Invalid RESP number")
+    Dim start As Integer = 0
+    If data.Item(0) = 45 Or data.Item(0) = 43 Then
+        If Not signed Then Throw New InvalidArgumentException("Unexpected RESP number sign")
+        start = 1
+    End If
+    If start = data.Count Then Throw New InvalidArgumentException("Missing RESP digits")
+    For i As Integer = start To data.Count - 1
+        If data.Item(i) < 48 Or data.Item(i) > 57 Then Throw New InvalidArgumentException("Invalid RESP digit")
+    Next
+    Dim negative As Boolean = data.Item(0) = 45
+    Dim lastDigit As Integer = 7
+    If negative Then lastDigit = 8
+    Dim number As Integer = 0
+    For i As Integer = start To data.Count - 1
+        Dim digit As Integer = data.Item(i) - 48
+        If number < -922337203685477580 Then Throw New InvalidArgumentException("RESP integer overflow")
+        If number = -922337203685477580 And digit > lastDigit Then Throw New InvalidArgumentException("RESP integer overflow")
+        number = number * 10 - digit
+    Next
+    If negative Then Return number
+    Return -number
+End Function
+
+''' Incremental RESP2 decoder; malformed input poisons it until Reset.
+Public Class RespDecoder
+    Private Property mBuffer As Bytes = New Bytes()
+    Private Property mOffset As Integer = 0
+    Private Property mHeaderScan As Integer = 0
+    Private Property mFrames As Array Of RespFrame = []
+    Private Property mReady As Array Of RespValue = []
+    Private Property mBulkLength As Integer = -2
+    Private Property mNodes As Integer = 0
+    Private Property mMessageBytes As Integer = 0
+    Private Property mQueuedBytes As Integer = 0
+    Private Property mReadySizes As Array Of Integer = []
+    Private Property mMaxBytes As Integer
+    Private Property mMaxNodes As Integer
+    Private Property mMaxDepth As Integer
+    Private Property mMaxReady As Integer
+    Private Property mFailed As Boolean = False
+
+    Public Sub Constructor(maxBytes As Integer = 1048576, maxNodes As Integer = 10000, maxDepth As Integer = 32, maxReady As Integer = 1000)
+        If maxBytes < 16 Or maxBytes > 67108864 Or maxNodes < 1 Or maxNodes > 1000000 Or maxDepth < 1 Or maxDepth > 128 Or maxReady < 1 Or maxReady > 100000 Then Throw New InvalidArgumentException("Invalid RESP decoder limits")
+        mMaxBytes = maxBytes
+        mMaxNodes = maxNodes
+        mMaxDepth = maxDepth
+        mMaxReady = maxReady
+    End Sub
+
+    Public Property ReadyCount As Integer
+        Get
+            Return Array.Count(mReady)
+        End Get
+    End Property
+
+    Public Property Failed As Boolean
+        Get
+            Return mFailed
+        End Get
+    End Property
+
+    Public Sub Reset()
+        mBuffer = New Bytes()
+        mOffset = 0
+        mHeaderScan = 0
+        Array.Clear(mFrames)
+        Array.Clear(mReady)
+        mBulkLength = -2
+        mNodes = 0
+        mMessageBytes = 0
+        mQueuedBytes = 0
+        Array.Clear(mReadySizes)
+        mFailed = False
+    End Sub
+
+    Private Sub Accept(value As RespValue)
+        While True
+            If Array.Count(mFrames) = 0 Then
+                If Array.Count(mReady) >= mMaxReady Then Throw New InvalidArgumentException("RESP ready queue limit")
+                If mMessageBytes > mMaxBytes - mQueuedBytes Then Throw New InvalidArgumentException("RESP ready byte limit")
+                Array.Append(mReady, value)
+                Array.Append(mReadySizes, mMessageBytes)
+                mQueuedBytes += mMessageBytes
+                mMessageBytes = 0
+                mNodes = 0
+                Return
+            End If
+            Dim frame As RespFrame = mFrames(Array.Count(mFrames) - 1)
+            Array.Append(frame.Value.Items, value)
+            frame.Remaining -= 1
+            If frame.Remaining > 0 Then Return
+            value = frame.Value
+            Array.RemoveAt(mFrames, Array.Count(mFrames) - 1)
+        End While
+    End Sub
+
+    Private Function Header() As Bytes
+        Dim start As Integer = mOffset + 1
+        Dim i As Integer = start
+        If mHeaderScan > i Then i = mHeaderScan
+        While i < mBuffer.Count
+            Dim ch As Integer = mBuffer.Item(i)
+            If ch = 10 Then Throw New InvalidArgumentException("RESP bare LF")
+            If ch = 13 Then
+                If i + 1 = mBuffer.Count Then
+                    mHeaderScan = i
+                    Return Nil
+                End If
+                If mBuffer.Item(i + 1) <> 10 Then Throw New InvalidArgumentException("RESP CR without LF")
+                Dim line As Bytes = RespSlice(mBuffer, start, i - start)
+                mOffset = i + 2
+                mHeaderScan = 0
+                Return line
+            End If
+            i += 1
+        End While
+        mHeaderScan = i
+        Return Nil
+    End Function
+
+    Public Sub Feed(data As Bytes)
+        If mFailed Then Throw New InvalidArgumentException("RESP decoder requires Reset")
+        If data Is Nil Then Throw New InvalidArgumentException("RESP input must not be Nil")
+        Try
+            If data.Count > mMaxBytes - mBuffer.Count Then Throw New InvalidArgumentException("RESP input buffer limit")
+            mBuffer.Append(data)
+            While mOffset < mBuffer.Count
+                If mBulkLength >= 0 Then
+                    If mBuffer.Count - mOffset < mBulkLength + 2 Then Exit While
+                    If mBuffer.Item(mOffset + mBulkLength) <> 13 Or mBuffer.Item(mOffset + mBulkLength + 1) <> 10 Then Throw New InvalidArgumentException("RESP bulk terminator")
+                    Dim bulk As New RespValue()
+                    bulk.Kind = RespKind.BulkString
+                    bulk.Data = RespSlice(mBuffer, mOffset, mBulkLength)
+                    mOffset += mBulkLength + 2
+                    mMessageBytes += mBulkLength + 2
+                    mBulkLength = -2
+                    Me.Accept(bulk)
+                    Continue While
+                End If
+                Dim prefix As Integer = mBuffer.Item(mOffset)
+                If prefix <> 43 And prefix <> 45 And prefix <> 58 And prefix <> 36 And prefix <> 42 Then Throw New InvalidArgumentException("Unsupported RESP prefix")
+                Dim line As Bytes = Me.Header()
+                If line Is Nil Then Exit While
+                If line.Count + 3 > mMaxBytes - mMessageBytes Then Throw New InvalidArgumentException("RESP message byte limit")
+                mMessageBytes += line.Count + 3
+                mNodes += 1
+                If mNodes > mMaxNodes Then Throw New InvalidArgumentException("RESP node limit")
+                Dim value As New RespValue()
+                Select Case prefix
+                    Case 43
+                        value.Kind = RespKind.SimpleString
+                        value.Data = line
+                    Case 45
+                        value.Kind = RespKind.ErrorReply
+                        value.Data = line
+                    Case 58
+                        value.Kind = RespKind.IntegerReply
+                        value.Number = RespNumber(line, True)
+                    Case 36, 42
+                        Dim count As Integer
+                        If line.Count = 2 Then
+                            If line.Item(0) = 45 And line.Item(1) = 49 Then
+                                count = -1
+                            Else
+                                count = RespNumber(line, False)
+                            End If
+                        Else
+                            count = RespNumber(line, False)
+                        End If
+                        If prefix = 36 Then
+                            If count = -1 Then
+                                value.Kind = RespKind.NullBulk
+                            Else
+                                If count > mMaxBytes - mMessageBytes - 2 Then Throw New InvalidArgumentException("RESP bulk limit")
+                                mBulkLength = count
+                                Continue While
+                            End If
+                        Else
+                            If count = -1 Then
+                                value.Kind = RespKind.NullArray
+                            Else
+                                If count > mMaxNodes - mNodes Then Throw New InvalidArgumentException("RESP array limit")
+                                value.Kind = RespKind.ArrayReply
+                                If count > 0 Then
+                                    If Array.Count(mFrames) >= mMaxDepth Then Throw New InvalidArgumentException("RESP nesting limit")
+                                    Dim frame As New RespFrame()
+                                    frame.Value = value
+                                    frame.Remaining = count
+                                    Array.Append(mFrames, frame)
+                                    Continue While
+                                End If
+                            End If
+                        End If
+                End Select
+                Me.Accept(value)
+            End While
+            If mOffset > 0 Then
+                mBuffer = RespSlice(mBuffer, mOffset, mBuffer.Count - mOffset)
+                mHeaderScan -= mOffset
+                If mHeaderScan < 0 Then mHeaderScan = 0
+            End If
+            mOffset = 0
+        Catch e As Exception
+            mFailed = True
+            Array.Clear(mReady)
+            Throw e
+        End Try
+    End Sub
+
+    Public Function Take() As RespValue
+        If mFailed Then Throw New InvalidArgumentException("RESP decoder requires Reset")
+        If Array.Count(mReady) = 0 Then Return Nil
+        Dim value As RespValue = mReady(0)
+        Array.RemoveAt(mReady, 0)
+        mQueuedBytes -= mReadySizes(0)
+        Array.RemoveAt(mReadySizes, 0)
+        Return value
+    End Function
+
+    Public Sub Finish()
+        If mFailed Then Throw New InvalidArgumentException("RESP decoder requires Reset")
+        If mBuffer.Count > 0 Or Array.Count(mFrames) > 0 Or mBulkLength <> -2 Then
+            mFailed = True
+            Array.Clear(mReady)
+            Throw New InvalidArgumentException("Truncated RESP stream")
+        End If
+    End Sub
+End Class
+
+''' Encode an array of binary bulk-string arguments. Arguments are never modified.
+Public Function EncodeRedisCommand(arguments As Array Of Bytes, maxBytes As Integer = 1048576) As Bytes
+    If maxBytes < 16 Or maxBytes > 67108864 Or Array.Count(arguments) < 1 Or Array.Count(arguments) > 10000 Then Throw New InvalidArgumentException("Invalid Redis command limits")
+    Dim output As Bytes = Bytes.FromString("*" + String.From(Array.Count(arguments)) + "\r\n", Text.Encodings.ASCII)
+    For Each argument As Bytes In arguments
+        If argument Is Nil Then Throw New InvalidArgumentException("Redis command argument is Nil")
+        Dim header As Bytes = Bytes.FromString("$" + String.From(argument.Count) + "\r\n", Text.Encodings.ASCII)
+        If header.Count + 2 > maxBytes - output.Count Then Throw New InvalidArgumentException("Redis command size limit")
+        If argument.Count > maxBytes - output.Count - header.Count - 2 Then Throw New InvalidArgumentException("Redis command size limit")
+        output.Append(header)
+        output.Append(argument)
+        output.Append(13)
+        output.Append(10)
+    Next
+    Return output
+End Function
+
+Public Function RedisUTF8Arguments(arguments As Array Of String) As Array Of Bytes
+    Dim output() As Bytes
+    For Each argument As String In arguments
+        Array.Append(output, Bytes.FromString(argument, Text.Encodings.UTF8))
+    Next
+    Return output
+End Function
+
+Public Class RedisCommand
+    Public Property Arguments As Array Of Bytes
+    Public Sub Constructor(arguments As Array Of Bytes)
+        ' Encoded at pipeline entry before any I/O; caller owns argument buffers.
+        Me.Arguments = Array.Clone(arguments)
+    End Sub
+End Class
+
+''' Console-only synchronous RESP2 IPv4 connection, single caller, plain TCP.
+Public Class RedisConnection
+    Private Property mSocket As TCPSocket
+    Private Property mTimeout As Integer
+    Private Property mBusy As Boolean = False
+
+    Public Sub Constructor(timeoutMs As Integer = 5000)
+        If timeoutMs < 1 Or timeoutMs > 600000 Then Throw New InvalidArgumentException("Redis timeout must be 1..600000 ms")
+        mTimeout = timeoutMs
+    End Sub
+
+    Public Sub ConnectIPv4(address As String, port As Integer = 6379)
+        If mBusy Then Throw New InvalidArgumentException("Redis connection busy")
+        If port < 1 Or port > 65535 Then Throw New InvalidArgumentException("Invalid Redis port")
+        Me.Close()
+        Dim socket As New TCPSocket()
+        socket.Timeout = mTimeout
+        Try
+            socket.Connect(address, port)
+            mSocket = socket
+        Catch e As Exception
+            socket.Close()
+            Throw e
+        End Try
+    End Sub
+
+    Public Sub Close()
+        If mSocket IsNot Nil Then mSocket.Close()
+        mSocket = Nil
+    End Sub
+
+    Public Function Execute(arguments As Array Of Bytes) As RespValue
+        Dim command As New RedisCommand(arguments)
+        Dim replies As Array Of RespValue = Me.Pipeline([command])
+        Return replies(0)
+    End Function
+
+    Public Function Pipeline(commands As Array Of RedisCommand) As Array Of RespValue
+        If mBusy Or mSocket Is Nil Then Throw New InvalidArgumentException("Redis connection unavailable")
+        If Array.Count(commands) < 1 Or Array.Count(commands) > 1000 Then Throw New InvalidArgumentException("Redis pipeline count limit")
+        Dim wire As New Bytes()
+        For Each command As RedisCommand In commands
+            If command Is Nil Then Throw New InvalidArgumentException("Redis command is Nil")
+            Dim encoded As Bytes = EncodeRedisCommand(command.Arguments)
+            Dim name As String = String.UCase(command.Arguments(0).ToString(Text.Encodings.ASCII))
+            If name = "SUBSCRIBE" Or name = "PSUBSCRIBE" Or name = "SSUBSCRIBE" Or name = "MONITOR" Or name = "HELLO" Then Throw New InvalidArgumentException("Redis command changes connection mode")
+            If encoded.Count > 1048576 - wire.Count Then Throw New InvalidArgumentException("Redis pipeline size limit")
+            wire.Append(encoded)
+        Next
+        Dim decoder As New RespDecoder()
+        Dim replies() As RespValue
+        mBusy = True
+        Try
+            Dim start As Integer = System.Microseconds()
+            mSocket.Write(wire)
+            While Array.Count(replies) < Array.Count(commands)
+                RunLoop.Pump(0)
+                If mSocket.BytesAvailable > 0 Then
+                    decoder.Feed(mSocket.Read(65536))
+                    While decoder.ReadyCount > 0
+                        Array.Append(replies, decoder.Take())
+                        If Array.Count(replies) > Array.Count(commands) Then Throw New InvalidArgumentException("Unexpected unsolicited Redis reply")
+                    End While
+                End If
+                If Array.Count(replies) = Array.Count(commands) Then Exit While
+                If Not mSocket.IsConnected And mSocket.BytesAvailable = 0 Then Throw New InvalidArgumentException("Redis peer closed before all replies")
+                If System.Microseconds() - start > mTimeout * 1000 Then Throw New InvalidArgumentException("Redis reply deadline exceeded")
+                Thread.Sleep(1)
+            End While
+            decoder.Finish()
+            Return replies
+        Catch e As Exception
+            Me.Close()
+            Throw e
+        Finally
+            mBusy = False
+        End Try
+    End Function
+End Class

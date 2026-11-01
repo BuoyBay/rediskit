@@ -1,0 +1,16 @@
+Import rediskit
+
+Sub Main()
+    Dim wire As Bytes = EncodeRedisCommand(RedisUTF8Arguments(["SET", "greeting", "Hello, 世界"]))
+    Print "Offline command frame (hex): " + wire.ToHex()
+    Dim decoder As New RespDecoder()
+    decoder.Feed(Bytes.FromString("*2\r\n+OK\r\n$-1\r\n", Text.Encodings.ASCII))
+    decoder.Finish()
+    Dim reply As RespValue = decoder.Take()
+    Print "Decoded elements: " + String.From(Array.Count(reply.Items))
+    ' To contact your own local server explicitly:
+    ' Dim client As New RedisConnection(2000)
+    ' client.ConnectIPv4("127.0.0.1", 6379)
+    ' Dim pong As RespValue = client.Execute(RedisUTF8Arguments(["PING"]))
+    ' client.Close()
+End Sub

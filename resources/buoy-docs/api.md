@@ -87,13 +87,6 @@ the server even if its reply was lost.
 
 ## Build and verification
 
-
-The runner seals fresh source, checks module/test/example on all six desktop
-targets, executes binary-safe codec tests, and uses a Python localhost TCP mock
-for pipeline framing, fragmented binary replies, connection reuse, reply
-timeouts and a peer closing after a 200,000-byte reply. It contacts no external server. The example is offline by default.
-Linux is the executed platform; macOS/Windows are compiler-checked only.
-
 The installed Buoy 0.72.0 Linux compiler omits the TLS archive needed by TCPSocket,
 even for plain sockets. The runner follows this repository's existing Xippets
 server builder: use the host native stubs directory and add
@@ -104,7 +97,4 @@ select the compiler and packager; default packager is `/usr/bin/buoy`.
 
 Provenance and parity describe the inspected upstream.
 
-
 [Typed API](typed-api.md) · [Getting started](getting-started.md)
-
-Test suites and fixtures are maintainer-local and are not part of this public repository.

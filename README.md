@@ -1,8 +1,8 @@
 # Encode RESP2 messages and run synchronous Redis pipelines
 
 A bounded incremental RESP2 codec and small synchronous IPv4 Redis connection.
-`Import rediskit`. The codec algorithm is pure Buoy; `RedisConnection` uses
-Buoy's existing TCPSocket and console RunLoop APIs. The compiler may link socket
+`Import rediskit`. The codec algorithm is source-only; `RedisConnection` uses
+the existing TCPSocket and console RunLoop APIs. The compiler may link socket
 dependencies even for codec-only consumers of this package. There is no new
 socket bridge.
 
@@ -45,8 +45,6 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 

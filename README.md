@@ -1,4 +1,4 @@
-# RESP2 codec and synchronous Redis pipelines
+# RESP2 Redis client
 
 A bounded incremental RESP2 codec and small synchronous IPv4 Redis connection.
 `Import rediskit`. The codec algorithm is source-only; `RedisConnection` uses

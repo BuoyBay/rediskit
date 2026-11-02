@@ -1,1 +1,1 @@
-{"schema":1,"name":"rediskit","version":"0.1.0","description":"Bounded incremental RESP2 codec and synchronous IPv4 Redis pipelines"}
+{"schema":1,"name":"rediskit","version":"0.1.0","description":"RESP2 codec and synchronous Redis pipelines"}

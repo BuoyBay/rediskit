@@ -1,4 +1,4 @@
-# Encode RESP2 messages and run synchronous Redis pipelines
+# RESP2 codec and synchronous Redis pipelines
 
 A bounded incremental RESP2 codec and small synchronous IPv4 Redis connection.
 `Import rediskit`. The codec algorithm is source-only; `RedisConnection` uses
@@ -19,7 +19,7 @@ consumer project for reproducible installs.
 
 ## Example
 
-```buoy
+```basic
 Dim client As New RedisConnection(2000)
 client.ConnectIPv4("127.0.0.1", 6379)
 Dim reply As RespValue = client.Execute(RedisUTF8Arguments(["PING"]))
